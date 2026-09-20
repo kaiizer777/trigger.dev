@@ -210,6 +210,19 @@ export async function updateTriggerPackages(
     return hasOutput;
   }
 
+  const hasDirectUpdates = mismatches.some(
+    (d) =>
+      !d.rawVersion?.startsWith("catalog:") && !packageJson[d.type]![d.name]?.startsWith("catalog:")
+  );
+
+  if (!hasDirectUpdates) {
+    mutatePackageJsonWithUpdatedPackages(packageJson, mismatches, cliVersion);
+    if (!embedded) {
+      outro("No direct package.json updates needed. Please update your workspace catalog.");
+    }
+    return hasOutput;
+  }
+
   const installSpinner = spinner();
   installSpinner.start("Updating dependencies in package.json");
 
@@ -279,6 +292,7 @@ export type Dependency = {
   type: "dependencies" | "devDependencies";
   name: string;
   version: string;
+  rawVersion?: string;
 };
 
 export function getVersionMismatches(
@@ -298,6 +312,12 @@ export function getVersionMismatches(
       dep.version.startsWith("https://pkg.pr.new") ||
       dep.version.startsWith("0.0.0")
     ) {
+      continue;
+    }
+
+    // Skip unresolvable non-semver specifiers (like raw "catalog:", "workspace:*", or unknown protocols)
+    // so unknown protocols don't trigger false mismatch errors or crashes.
+    if (!semver.validRange(dep.version) && !semver.valid(dep.version)) {
       continue;
     }
 
@@ -340,7 +360,7 @@ export async function getTriggerDependencies(
         continue;
       }
 
-      if (version.startsWith("workspace") || version.startsWith("catalog:")) {
+      if (version.startsWith("workspace")) {
         continue;
       }
 
@@ -356,7 +376,13 @@ export async function getTriggerDependencies(
 
       const $version = await tryResolveTriggerPackageVersion(name, dirname(packageJsonPath));
 
-      deps.push({ type, name, version: $version ?? version });
+      // If resolution fails for a catalog: dependency, skip it so unresolvable catalog specifiers
+      // don't flow downstream as invalid semver or cause crashes.
+      if (!$version && version.startsWith("catalog:")) {
+        continue;
+      }
+
+      deps.push({ type, name, version: $version ?? version, rawVersion: version });
     }
   }
 
@@ -401,19 +427,37 @@ export async function tryResolveTriggerPackageVersion(
   }
 }
 
-function mutatePackageJsonWithUpdatedPackages(
+export function mutatePackageJsonWithUpdatedPackages(
   packageJson: PackageJson,
   depsToUpdate: Dependency[],
   targetVersion: string
 ) {
-  for (const { type, name, version: _version } of depsToUpdate) {
+  const catalogDeps: Dependency[] = [];
+
+  for (const dep of depsToUpdate) {
+    const { type, name, rawVersion } = dep;
+
     if (!packageJson[type]) {
       throw new Error(
         `No ${type} entry found in package.json. Please try to upgrade manually instead.`
       );
     }
 
+    if (rawVersion?.startsWith("catalog:") || packageJson[type]![name]?.startsWith("catalog:")) {
+      catalogDeps.push(dep);
+      continue;
+    }
+
     packageJson[type]![name] = targetVersion;
+  }
+
+  if (catalogDeps.length > 0) {
+    prettyWarning(
+      "Workspace catalog dependencies detected",
+      `The following dependencies use catalogs and should be updated in your workspace catalog configuration:\n${catalogDeps
+        .map((d) => `  - ${d.name} (installed: ${d.version}, target: ${targetVersion})`)
+        .join("\n")}`
+    );
   }
 }
 
@@ -428,7 +472,9 @@ function printUpdateTable(
 
   const tableData = depsToUpdate.map((dep) => ({
     package: dep.name,
-    [oldColumn]: dep.version,
+    [oldColumn]: dep.rawVersion?.startsWith("catalog:")
+      ? `${dep.version} (${dep.rawVersion})`
+      : dep.version,
     [newColumn]: targetVersion,
   }));
 

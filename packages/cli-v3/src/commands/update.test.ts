@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { getTriggerDependencies, getVersionMismatches, type Dependency } from "./update.js";
+import {
+  getTriggerDependencies,
+  getVersionMismatches,
+  mutatePackageJsonWithUpdatedPackages,
+  type Dependency,
+} from "./update.js";
 
 describe("getTriggerDependencies", () => {
-  it("skips dependencies using catalog: and workspace: protocols", async () => {
+  it("skips unresolvable catalog: and workspace: protocols", async () => {
     const packageJson = {
       dependencies: {
         "@trigger.dev/sdk": "catalog:",
@@ -39,17 +44,19 @@ describe("getTriggerDependencies", () => {
       type: "dependencies",
       name: "@trigger.dev/sdk",
       version: "^3.0.0",
+      rawVersion: "^3.0.0",
     });
     expect(deps).toContainEqual({
       type: "devDependencies",
       name: "@trigger.dev/core",
       version: "~3.0.0",
+      rawVersion: "~3.0.0",
     });
   });
 });
 
 describe("getVersionMismatches", () => {
-  it("does not throw when encountering non-semver strings like catalog: or workspace:", () => {
+  it("skips unknown protocols and invalid semver strings from mismatches without throwing", () => {
     const deps: Dependency[] = [
       {
         type: "dependencies",
@@ -76,7 +83,29 @@ describe("getVersionMismatches", () => {
     expect(() => getVersionMismatches(deps, "3.0.0")).not.toThrow();
 
     const { mismatches, isDowngrade } = getVersionMismatches(deps, "3.0.0");
-    expect(mismatches).toHaveLength(4);
+    // Unknown protocols and unresolvable non-semver strings should not remain as mismatches
+    expect(mismatches).toHaveLength(0);
+    expect(isDowngrade).toBe(false);
+  });
+
+  it("enforces version mismatch checks on resolved catalog dependencies", () => {
+    const deps: Dependency[] = [
+      {
+        type: "dependencies",
+        name: "@trigger.dev/sdk",
+        version: "4.5.0",
+        rawVersion: "catalog:",
+      },
+    ];
+
+    const { mismatches, isDowngrade } = getVersionMismatches(deps, "4.6.3");
+    expect(mismatches).toHaveLength(1);
+    expect(mismatches[0]).toEqual({
+      type: "dependencies",
+      name: "@trigger.dev/sdk",
+      version: "4.5.0",
+      rawVersion: "catalog:",
+    });
     expect(isDowngrade).toBe(false);
   });
 
@@ -116,5 +145,38 @@ describe("getVersionMismatches", () => {
     const { mismatches, isDowngrade } = getVersionMismatches(deps, "3.0.0");
     expect(mismatches).toHaveLength(0);
     expect(isDowngrade).toBe(false);
+  });
+});
+
+describe("mutatePackageJsonWithUpdatedPackages", () => {
+  it("does not overwrite catalog: references in package.json", () => {
+    const packageJson = {
+      dependencies: {
+        "@trigger.dev/sdk": "catalog:",
+        "@trigger.dev/core": "^4.5.0",
+      },
+    };
+
+    const depsToUpdate: Dependency[] = [
+      {
+        type: "dependencies",
+        name: "@trigger.dev/sdk",
+        version: "4.5.0",
+        rawVersion: "catalog:",
+      },
+      {
+        type: "dependencies",
+        name: "@trigger.dev/core",
+        version: "4.5.0",
+        rawVersion: "^4.5.0",
+      },
+    ];
+
+    mutatePackageJsonWithUpdatedPackages(packageJson, depsToUpdate, "4.6.3");
+
+    // catalog: dependency should remain untouched in package.json
+    expect(packageJson.dependencies["@trigger.dev/sdk"]).toBe("catalog:");
+    // standard dependency should be updated to target CLI version
+    expect(packageJson.dependencies["@trigger.dev/core"]).toBe("4.6.3");
   });
 });
